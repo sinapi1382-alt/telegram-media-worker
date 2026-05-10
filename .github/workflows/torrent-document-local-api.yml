@@ -1,47 +1,1432 @@
-name: Download Torrent and Save as Artifact
+name: Torrent To Telegram Document Local API
+run-name: "AMD4x Torrent · ${{ inputs.file_mode }}"
 
 on:
   workflow_dispatch:
     inputs:
       torrent_url:
-        description: 'لینک مگنت تورنت'
+        description: "Magnet link or direct .torrent URL"
         required: true
         type: string
+      file_mode:
+        description: "Choose list first, selected for specific files, or all for everything"
+        required: false
+        default: "list"
+        type: choice
+        options:
+          - "list"
+          - "selected"
+          - "all"
+      selected_files:
+        description: "Torrent file indexes to download, e.g. 1 or 1,3 or 1-4. Used when file_mode=selected."
+        required: false
+        type: string
+      split_part_mib:
+        description: "Part size in MiB for large files. This is not a max-size cap."
+        required: false
+        default: "1900"
+        type: string
+      progress_chat_id:
+        description: "Telegram progress chat id"
+        required: false
+        type: string
+      progress_message_id:
+        description: "Telegram progress message id"
+        required: false
+        type: string
+      dispatch_key:
+        description: "Dispatch key"
+        required: false
+        default: "manual"
+        type: string
+
+permissions:
+  contents: read
+  packages: read
 
 jobs:
-  download:
+  torrent_document_send:
+    name: Download torrent and send as document
     runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    container:
+      image: ghcr.io/amd4x/tg-video-worker:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - name: Install aria2
+      - name: Download torrent and send through Local Bot API
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2
+          set -euo pipefail
 
-      - name: Create download folder
-        run: mkdir -p downloaded_files
+          echo "== Torrent To Telegram Document Local API =="
 
-      - name: Download with aria2
-        run: |
-          aria2c --seed-time=0 \
-                 --bt-tracker-timeout=120 \
-                 --bt-stop-timeout=300 \
-                 --max-connection-per-server=16 \
-                 --split=16 \
-                 --min-split-size=1M \
-                 --dir=downloaded_files \
-                 --console-log-level=notice \
-                 --follow-torrent=mem \
-                 "${{ inputs.torrent_url }}"
-        timeout-minutes: 30
+          get_workflow_input() {
+            python3 -c 'import json, os, sys; data=json.load(open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8")); print(((data.get("inputs") or {}).get(sys.argv[1], "") or ""), end="")' "$1"
+          }
 
-      - name: List downloaded files
-        run: |
-          echo "Files in downloaded_files:"
-          ls -la downloaded_files/ || echo "No files found!"
+          TORRENT_URL="$(get_workflow_input torrent_url)"
+          FILE_MODE="$(get_workflow_input file_mode)"
+          SELECTED_FILES="$(get_workflow_input selected_files)"
+          SPLIT_PART_MIB="$(get_workflow_input split_part_mib)"
+          PROGRESS_CHAT_ID="$(get_workflow_input progress_chat_id)"
+          PROGRESS_MESSAGE_ID="$(get_workflow_input progress_message_id)"
+          DISPATCH_KEY="$(get_workflow_input dispatch_key)"
 
-      - name: Upload as Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: torrent-download
-          path: downloaded_files/
-          if-no-files-found: warn
+          FILE_MODE="${FILE_MODE:-list}"
+          SELECTED_FILES="${SELECTED_FILES:-}"
+          SPLIT_PART_MIB="${SPLIT_PART_MIB:-1900}"
+          DISPATCH_KEY="${DISPATCH_KEY:-manual}"
+
+          DIRECT_TELEGRAM_MAX_BYTES="50000000"
+          LOCAL_BOT_API_MAX_BYTES="2000000000"
+          SPLIT_PART_MIB_MAX="1900"
+          LOCAL_BOT_API_STARTED="0"
+          TELEGRAM_BOT_API_PID=""
+          FINAL_SIZE_STATUS="OK"
+          TOTAL_SENT_FILES="0"
+          TOTAL_SENT_BYTES="0"
+          LAST_SEND_MODE="local"
+          LAST_SEND_METHOD="Document"
+
+          telegram_escape_html() {
+            python3 -c 'import html, sys; print(html.escape(sys.stdin.read(), quote=False), end="")'
+          }
+
+          format_bytes_for_telegram() {
+            python3 -c 'import math, sys; n=max(int(float(sys.argv[1])),0); units=["B","KB","MB","GB","TB"]; idx=0 if n < 1024 else min(int(math.log(max(n,1),1024)), len(units)-1); value=n/(1024**idx); print(f"{int(value)} B" if idx == 0 else f"{value:.2f} {units[idx]}")' "${1:-0}" 2>/dev/null || echo "Unknown"
+          }
+
+          telegram_send_mode_label() {
+            case "$1" in
+              public)
+                printf '%s' "Public Bot API"
+                ;;
+              local)
+                printf '%s' "Local Bot API"
+                ;;
+              *)
+                printf '%s' "${1:-Unknown}"
+                ;;
+            esac
+          }
+
+          progress_bar_text() {
+            local percent="$1"
+            local length=10
+            local filled=0
+            local empty=0
+            local bar=""
+            local i=0
+
+            if ! echo "$percent" | grep -Eq '^[0-9]+$'; then
+              percent=0
+            fi
+
+            if [ "$percent" -lt 0 ]; then
+              percent=0
+            fi
+
+            if [ "$percent" -gt 100 ]; then
+              percent=100
+            fi
+
+            filled=$((percent * length / 100))
+            empty=$((length - filled))
+
+            for i in $(seq 1 "$filled" 2>/dev/null); do
+              bar="${bar}█"
+            done
+
+            for i in $(seq 1 "$empty" 2>/dev/null); do
+              bar="${bar}░"
+            done
+
+            printf "%s" "$bar"
+          }
+
+          telegram_edit_progress() {
+            local percent="$1"
+            local label="$2"
+            local detail="$3"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            local safe_label=""
+            local safe_detail=""
+            local safe_run_url=""
+            local bar=""
+            local text=""
+
+            safe_label="$(printf "%s" "$label" | telegram_escape_html)"
+            safe_detail="$(printf "%s" "$detail" | tr "_" " " | telegram_escape_html)"
+            safe_run_url="$(printf "%s" "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-AMD4x/telegram-media-worker}/actions/runs/${GITHUB_RUN_ID:-unknown}" | telegram_escape_html)"
+            bar="$(progress_bar_text "$percent")"
+
+            printf -v text '🐙 <b>GitHub Remote</b>\n\n📊 <code>[%s] %s%%</code>\n🧭 <b>Status:</b> %s\nℹ️ <i>%s</i>\n🆔 <code>%s</code>\n🔗 <a href="%s">Open Run</a>' \
+              "$bar" \
+              "$percent" \
+              "$safe_label" \
+              "$safe_detail" \
+              "${GITHUB_RUN_ID:-unknown}" \
+              "$safe_run_url"
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -F "chat_id=${PROGRESS_CHAT_ID}" \
+              -F "message_id=${PROGRESS_MESSAGE_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          progress_stage() {
+            local stage="$1"
+            local percent="$2"
+            local label="$3"
+            local detail="$4"
+
+            echo "PROGRESS_STAGE=${stage}"
+            echo "PROGRESS_PERCENT=${percent}"
+            echo "PROGRESS_LABEL=${label}"
+            echo "PROGRESS_DETAIL=${detail}"
+
+            telegram_edit_progress "$percent" "$label" "$detail"
+          }
+
+          telegram_edit_torrent_summary() {
+            local title="$1"
+            local suffix="$2"
+            local size_bytes="$3"
+            local send_mode="$4"
+            local send_method="$5"
+            local file_count="$6"
+
+            if [ -z "${PROGRESS_CHAT_ID:-}" ] || [ -z "${PROGRESS_MESSAGE_ID:-}" ]; then
+              return 0
+            fi
+
+            local final_size_text=""
+            local send_mode_text=""
+            local safe_mode=""
+            local safe_count=""
+            local safe_send_mode=""
+            local safe_send_method=""
+            local safe_run_url=""
+            local text=""
+
+            final_size_text="$(format_bytes_for_telegram "${size_bytes:-0}")"
+            send_mode_text="$(telegram_send_mode_label "$send_mode")"
+
+            safe_mode="$(printf "%s" "${FILE_MODE:-unknown}" | telegram_escape_html)"
+            safe_count="$(printf "%s" "${file_count:-0}" | telegram_escape_html)"
+            safe_send_mode="$(printf "%s" "$send_mode_text" | telegram_escape_html)"
+            safe_send_method="$(printf "%s" "$send_method" | telegram_escape_html)"
+            safe_run_url="$(printf "%s" "${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-AMD4x/telegram-media-worker}/actions/runs/${GITHUB_RUN_ID:-unknown}" | telegram_escape_html)"
+
+            printf -v text '%s\n\n🌐 <b>Source:</b> <code>Torrent</code>\n🧭 <b>Path:</b> <code>github-torrent-document</code>\n📦 <b>Mode:</b> <code>%s</code>\n📄 <b>Files:</b> <code>%s</code>\n📏 <b>Final Size:</b> <code>%s</code> — %s\n🚀 <b>Send Mode:</b> <code>%s</code>\n📤 <b>Send Method:</b> <code>%s</code>\n🆔 <code>%s</code>\n🔗 <a href="%s">Open Run</a>' \
+              "$title" \
+              "$safe_mode" \
+              "$safe_count" \
+              "$final_size_text" \
+              "${FINAL_SIZE_STATUS:-OK}" \
+              "$safe_send_mode" \
+              "$safe_send_method" \
+              "${GITHUB_RUN_ID:-unknown}" \
+              "$safe_run_url"
+
+            if [ -n "$suffix" ]; then
+              text="$(printf '%s\n%s' "$text" "$suffix")"
+            fi
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/editMessageText" \
+              -F "chat_id=${PROGRESS_CHAT_ID}" \
+              -F "message_id=${PROGRESS_MESSAGE_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          send_notice() {
+            local title="$1"
+            local body="$2"
+            local safe_title=""
+            local safe_body=""
+            local text=""
+
+            safe_title="$(printf "%s" "$title" | telegram_escape_html)"
+            safe_body="$(printf "%s" "$body" | telegram_escape_html)"
+
+            printf -v text '%s\n\n%s' "$safe_title" "$safe_body"
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          print_torrent_log_safely() {
+            local log_file="$1"
+
+            if [ ! -f "$log_file" ]; then
+              return 0
+            fi
+
+            sed -E \
+              -e '/Exception caught while loading DHT routing table/d' \
+              -e '/DHTRoutingTableDeserializer/d' \
+              -e '/Failed to load DHT routing table/d' \
+              -e 's#magnet:\?[^[:space:]]+#<masked-magnet>#g' \
+              -e 's#https?://[^[:space:]]+#<masked-url>#g' \
+              -e 's#[A-Fa-f0-9]{40}#<masked-info-hash>#g' \
+              -e 's#(Info Hash: ).*#\1<masked-info-hash>#g' \
+              -e 's#(Magnet URI: ).*#\1<masked-magnet>#g' \
+              -e 's#(Name: ).*#\1<masked-name>#g' \
+              -e 's#(path/URI).*#\1 <masked>#g' \
+              -e 's#\[MEMORY\]\[METADATA\].*#[MEMORY][METADATA]<masked-metadata>#g' \
+              -e 's#(/__w|/github|/tmp|/home|/runner|/mnt|work)[^[:space:]]*#<masked-path>#g' \
+              -e 's#^[[:space:]]*[0-9]+[[:space:]]*\|.*#<masked-torrent-file>#g' \
+              -e 's#^[[:space:]]*\|.*#<masked-torrent-file-size>#g' \
+              -e 's#[0-9]+([.,][0-9]+)?[[:space:]]*(B|KiB|MiB|GiB|TiB|KB|MB|GB|TB)(/s)?#<masked-size>#g' \
+              -e 's#[0-9]{8,}#<masked-number>#g' \
+              "$log_file" | head -n 120
+          }
+
+          cleanup() {
+            if [ -n "${TELEGRAM_BOT_API_PID:-}" ]; then
+              kill "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1 || true
+            fi
+          }
+
+          fail_with_progress() {
+            local rc="$?"
+            progress_stage "failed" "100" "Failed" "Torrent_worker_failed"
+            telegram_edit_torrent_summary "❌ <b>GitHub Torrent failed</b>" "⚠️ <i>Check GitHub logs.</i>" "${TOTAL_SENT_BYTES:-0}" "${LAST_SEND_MODE:-local}" "${LAST_SEND_METHOD:-Document}" "${TOTAL_SENT_FILES:-0}"
+            exit "$rc"
+          }
+
+          trap cleanup EXIT
+          trap fail_with_progress ERR
+
+          sanitize_filename() {
+            local requested="$1"
+            local fallback="$2"
+            local name=""
+
+            if [ -n "$requested" ]; then
+              name="$(basename "$requested")"
+            else
+              name="$(basename "$fallback")"
+            fi
+
+            name="$(printf "%s" "$name" | tr -d '\000-\037' | sed 's/[\\/*?:"<>|]//g; s/^[ .]*//; s/[ .]*$//')"
+
+            if [ -z "$name" ]; then
+              name="torrent_document.bin"
+            fi
+
+            if [ "${#name}" -gt 120 ]; then
+              base="${name%.*}"
+              ext="${name##*.}"
+              if [ "$base" = "$name" ]; then
+                name="${name:0:120}"
+              else
+                max_base_len=$((120 - ${#ext} - 1))
+                if [ "$max_base_len" -lt 1 ]; then
+                  max_base_len=1
+                fi
+                name="${base:0:$max_base_len}.${ext}"
+              fi
+            fi
+
+            printf "%s" "$name"
+          }
+
+          safe_upload_filename() {
+            local requested="${1:-}"
+            local idx="${2:-file}"
+            local original_name=""
+            local name=""
+            local ext=""
+            local base=""
+            local max_base_len=""
+
+            original_name="$(basename "${requested:-}")"
+
+            if printf "%s" "$original_name" | grep -q '\.'; then
+              ext="${original_name##*.}"
+              ext="$(printf "%s" "$ext" | sed 's/[^A-Za-z0-9]//g' | cut -c1-10)"
+            fi
+
+            name="$original_name"
+
+            if command -v iconv >/dev/null 2>&1; then
+              name="$(printf "%s" "$name" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf "%s" "$name")"
+            fi
+
+            name="$(printf "%s" "$name" | tr -d '\000-\037' | sed 's/[\\/*?:"<>|;]//g; s/[^A-Za-z0-9._ -]/_/g; s/[[:space:]][[:space:]]*/ /g; s/^[ ._-]*//; s/[ ._-]*$//')"
+
+            if [ -z "$name" ]; then
+              if [ -n "$ext" ]; then
+                name="torrent-document-${idx}.${ext}"
+              else
+                name="torrent-document-${idx}.bin"
+              fi
+            fi
+
+            if [ "${#name}" -gt 100 ]; then
+              base="${name%.*}"
+              ext="${name##*.}"
+
+              if [ "$base" = "$name" ]; then
+                name="${name:0:100}"
+              else
+                max_base_len="$((100 - ${#ext} - 1))"
+                if [ "$max_base_len" -lt 1 ]; then
+                  max_base_len=1
+                fi
+                name="${base:0:$max_base_len}.${ext}"
+              fi
+            fi
+
+            printf "%s" "$name"
+          }
+
+          is_success_http_code() {
+            case "$1" in
+              2*)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          telegram_retry_after_seconds() {
+            local response_file="$1"
+            local retry_after=""
+
+            retry_after="$(
+              sed -nE 's/.*"retry_after"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$response_file" 2>/dev/null | head -n 1
+            )"
+
+            if ! echo "${retry_after:-}" | grep -Eq '^[0-9]+$'; then
+              retry_after="20"
+            fi
+
+            if [ "$retry_after" -lt 5 ]; then
+              retry_after="5"
+            fi
+
+            if [ "$retry_after" -gt 600 ]; then
+              retry_after="600"
+            fi
+
+            printf "%s" "$retry_after"
+          }
+
+          telegram_send_document_request() {
+            local api_base="$1"
+            local file_path="$2"
+            local display_name="$3"
+            local caption="$4"
+            local response_file="$5"
+
+            curl --ipv4 -sS \
+              --connect-timeout 20 \
+              --max-time 21600 \
+              -o "$response_file" \
+              -w "%{http_code}" \
+              -X POST "${api_base}/sendDocument" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              -F "document=@${file_path};filename=${display_name}" \
+              -F "parse_mode=HTML" \
+              -F "caption=${caption}"
+          }
+
+          telegram_send_document_request_with_retry() {
+            local api_base="$1"
+            local file_path="$2"
+            local display_name="$3"
+            local caption="$4"
+            local response_file="$5"
+            local attempt_label="${6:-document}"
+
+            local max_attempts=5
+            local attempt=1
+            local http_code="000"
+            local retry_after="20"
+
+            while [ "$attempt" -le "$max_attempts" ]; do
+              rm -f "$response_file"
+
+              http_code="$(telegram_send_document_request "$api_base" "$file_path" "$display_name" "$caption" "$response_file" 2>/dev/null || true)"
+
+              case "$http_code" in
+                429|000|408|500|502|503|504)
+                  ;;
+                *)
+                  printf "%s" "$http_code"
+                  return 0
+                  ;;
+              esac
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                printf "%s" "$http_code"
+                return 0
+              fi
+
+              if [ "$http_code" = "429" ]; then
+                retry_after="$(telegram_retry_after_seconds "$response_file")"
+              else
+                retry_after="20"
+              fi
+
+              echo "TELEGRAM_SEND_RETRY=1" >&2
+              echo "TELEGRAM_RETRY_CONTEXT=${attempt_label}" >&2
+              echo "TELEGRAM_RETRY_HTTP_CODE=${http_code}" >&2
+              echo "TELEGRAM_RETRY_ATTEMPT=masked" >&2
+              echo "::add-mask::${retry_after}" >&2
+              echo "TELEGRAM_RETRY_AFTER_SECONDS=masked" >&2
+
+              progress_stage "telegram_send_retry" "95" "Waiting" "Telegram_send_retry" >&2
+
+              sleep "$retry_after"
+              attempt=$((attempt + 1))
+            done
+
+            printf "%s" "$http_code"
+            return 0
+          }
+
+          start_local_bot_api() {
+            if [ "$LOCAL_BOT_API_STARTED" = "1" ]; then
+              return 0
+            fi
+
+            if ! command -v telegram-bot-api >/dev/null 2>&1; then
+              echo "ERROR: telegram-bot-api is missing from worker image."
+              exit 1
+            fi
+
+            local api_dir=""
+            local api_log=""
+            local port_http_code=""
+            local i=""
+
+            api_dir="$RUNNER_TEMP/telegram-bot-api"
+            api_log="$RUNNER_TEMP/telegram-bot-api.log"
+
+            mkdir -p "$api_dir"
+
+            echo "STARTING_LOCAL_BOT_API=1"
+            progress_stage "starting_local_bot_api" "75" "Starting_sender" "Starting_Local_Bot_API"
+
+            telegram-bot-api \
+              --api-id="$TELEGRAM_API_ID" \
+              --api-hash="$TELEGRAM_API_HASH" \
+              --local \
+              --http-ip-address=127.0.0.1 \
+              --http-port=8081 \
+              --dir="$api_dir" > "$api_log" 2>&1 &
+
+            TELEGRAM_BOT_API_PID="$!"
+
+            for i in $(seq 1 90); do
+              if ! kill -0 "$TELEGRAM_BOT_API_PID" >/dev/null 2>&1; then
+                echo "ERROR: Local Bot API process exited before becoming ready."
+                exit 1
+              fi
+
+              port_http_code="$(
+                curl -sS \
+                  --connect-timeout 1 \
+                  --max-time 2 \
+                  -o /dev/null \
+                  -w "%{http_code}" \
+                  "http://127.0.0.1:8081/" 2>/dev/null || true
+              )"
+
+              if [ -n "$port_http_code" ] && [ "$port_http_code" != "000" ]; then
+                echo "LOCAL_BOT_API_READY=1"
+                LOCAL_BOT_API_STARTED="1"
+                progress_stage "local_bot_api_ready" "80" "Sender_ready" "Local_Bot_API_ready"
+                return 0
+              fi
+
+              if [ "$i" = "1" ] || [ "$i" = "30" ] || [ "$i" = "60" ] || [ "$i" = "90" ]; then
+                echo "LOCAL_BOT_API_WAIT=${i}/90"
+                echo "LOCAL_BOT_API_PROCESS=alive"
+                echo "LOCAL_BOT_API_PORT_HTTP_CODE=${port_http_code:-000}"
+              fi
+
+              sleep 1
+            done
+
+            echo "ERROR: Local Bot API did not become ready."
+            exit 1
+          }
+
+          send_split_notice() {
+            local parts_count="$1"
+            local total_bytes="$2"
+            local total_size_text=""
+            local text=""
+
+            total_size_text="$(format_bytes_for_telegram "${total_bytes:-0}")"
+
+            printf -v text '📦 <b>Large GitHub Document</b>\n\nThe file is larger than Telegram single-file limit, so it will be sent in <b>%s parts</b>.\n\n📥 <b>Total Size:</b> <code>%s</code>\nℹ️ <i>Download all parts, then join them in order to restore the original file.</i>' \
+              "$parts_count" \
+              "$total_size_text"
+
+            curl -sS \
+              --connect-timeout 10 \
+              --max-time 20 \
+              -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              -F "parse_mode=HTML" \
+              -F "disable_web_page_preview=true" \
+              -F "text=${text}" >/dev/null 2>&1 || true
+          }
+
+          send_document_file() {
+            local file_path="$1"
+            local display_name="$2"
+            local caption_prefix="$3"
+            local file_index="$4"
+            local files_total="$5"
+
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: File missing before Telegram send."
+              exit 1
+            fi
+
+            local file_size=""
+            local file_size_text=""
+            local safe_display=""
+            local safe_size=""
+            local caption=""
+            local api_base=""
+            local response_file=""
+            local http_code=""
+            local send_mode="local"
+            local upload_name=""
+            local upload_path=""
+
+            file_size="$(stat -c%s "$file_path" 2>/dev/null || echo 0)"
+
+            if [ "$file_size" -le 0 ]; then
+              echo "ERROR: File is empty before Telegram send."
+              exit 1
+            fi
+
+            echo "TORRENT_SEND_FILE_INDEX=masked"
+            echo "TORRENT_SEND_FILES_TOTAL=masked"
+            echo "::add-mask::${file_size}"
+            echo "TORRENT_SEND_FILE_SIZE_BYTES=masked"
+            echo "TORRENT_SEND_FILE_NAME=masked"
+
+            file_size_text="$(format_bytes_for_telegram "$file_size")"
+            safe_display="$(printf "%s" "$display_name" | telegram_escape_html)"
+            safe_size="$(printf "%s" "$file_size_text" | telegram_escape_html)"
+            upload_name="$(safe_upload_filename "$display_name" "$file_index")"
+            upload_path="$RUNNER_TEMP/telegram-upload-${file_index}-${upload_name}"
+
+            if [ "$file_size" -gt "$LOCAL_BOT_API_MAX_BYTES" ]; then
+              send_large_file_as_parts "$file_path" "$display_name" "$caption_prefix" "$file_index" "$files_total"
+              return 0
+            fi
+
+            if [ "$file_size" -le "$DIRECT_TELEGRAM_MAX_BYTES" ]; then
+              api_base="https://api.telegram.org/bot${TELEGRAM_TOKEN}"
+              send_mode="public"
+              echo "TELEGRAM_SEND_MODE=public"
+            else
+              start_local_bot_api
+              api_base="http://127.0.0.1:8081/bot${TELEGRAM_TOKEN}"
+              send_mode="local"
+              echo "TELEGRAM_SEND_MODE=local"
+            fi
+
+            rm -f "$upload_path"
+            ln "$file_path" "$upload_path" 2>/dev/null || cp -f "$file_path" "$upload_path"
+
+            if [ ! -f "$upload_path" ]; then
+              echo "ERROR: Upload staging file was not created."
+              exit 1
+            fi
+
+            printf -v caption '%s\n📄 %s\n📦 %s' "$caption_prefix" "$safe_display" "$safe_size"
+
+            progress_stage "ready_to_send" "85" "Ready" "Document_ready_to_send"
+            telegram_edit_torrent_summary "✅ <b>GitHub Torrent ready</b>" "⏳ <i>Sending to Telegram...</i>" "$file_size" "$send_mode" "Document" "${file_index}/${files_total}"
+
+            sleep 3
+
+            progress_stage "sending" "90" "Sending" "Sending_document_to_Telegram"
+
+            response_file="$RUNNER_TEMP/telegram-document-${file_index}.json"
+            http_code="$(telegram_send_document_request_with_retry "$api_base" "$upload_path" "$upload_name" "$caption" "$response_file" "document")"
+
+            echo "TELEGRAM_DOCUMENT_HTTP_CODE=${http_code}"
+
+            if ! is_success_http_code "$http_code" || ! grep -q '"ok":true' "$response_file"; then
+              rm -f "$upload_path" || true
+              echo "Telegram document send failed."
+              echo "Telegram response is hidden for public-log safety."
+              exit 1
+            fi
+
+            rm -f "$upload_path" || true
+
+            TOTAL_SENT_FILES=$((TOTAL_SENT_FILES + 1))
+            TOTAL_SENT_BYTES=$((TOTAL_SENT_BYTES + file_size))
+            LAST_SEND_MODE="$send_mode"
+            LAST_SEND_METHOD="Document"
+
+            echo "TELEGRAM_SEND=success"
+            echo "TELEGRAM_SEND_METHOD=document"
+          }
+
+          send_large_file_as_parts() {
+            local file_path="${1:-}"
+            local display_name="${2:-}"
+            local caption_prefix="${3:-}"
+            local file_index="${4:-1}"
+            local files_total="${5:-1}"
+
+            local file_size=""
+            local file_size_text=""
+            local part_count=""
+            local part_index=""
+            local skip_mib=""
+            local part_path=""
+            local part_name=""
+            local part_size=""
+            local part_size_text=""
+            local api_base=""
+            local response_file=""
+            local http_code=""
+            local caption=""
+            local percent=""
+            local safe_display=""
+
+            file_size="$(stat -c%s "$file_path" 2>/dev/null || echo 0)"
+            file_size_text="$(format_bytes_for_telegram "$file_size")"
+            part_count="$(( (file_size + SPLIT_PART_BYTES - 1) / SPLIT_PART_BYTES ))"
+            safe_display="$(printf "%s" "$display_name" | telegram_escape_html)"
+
+            echo "SENDING_SPLIT_DOCUMENT_TO_TELEGRAM=1"
+            echo "DOCUMENT_SPLIT_PARTS_COUNT=masked"
+            echo "DOCUMENT_SPLIT_TOTAL_BYTES=masked"
+            echo "::add-mask::${file_size}"
+
+            send_split_notice "$part_count" "$file_size"
+            start_local_bot_api
+
+            api_base="http://127.0.0.1:8081/bot${TELEGRAM_TOKEN}"
+            part_index="1"
+
+            while [ "$part_index" -le "$part_count" ]; do
+              skip_mib="$(( (part_index - 1) * SPLIT_PART_MIB ))"
+              part_name="$(safe_upload_filename "${display_name}.part$(printf "%03d" "$part_index")" "${file_index}-${part_index}")"
+              part_path="$RUNNER_TEMP/${part_name}"
+
+              rm -f "$part_path"
+
+              dd if="$file_path" of="$part_path" bs=1M skip="$skip_mib" count="$SPLIT_PART_MIB" iflag=fullblock status=none
+
+              if [ ! -f "$part_path" ]; then
+                echo "ERROR: Split part was not created."
+                exit 1
+              fi
+
+              part_size="$(stat -c%s "$part_path" 2>/dev/null || echo 0)"
+
+              if [ "$part_size" -le 0 ] || [ "$part_size" -gt "$LOCAL_BOT_API_MAX_BYTES" ]; then
+                echo "ERROR: Split document part size is invalid before send."
+                echo "DOCUMENT_PART_INDEX=masked"
+                echo "::add-mask::${part_size}"
+                echo "DOCUMENT_PART_SIZE_BYTES=masked"
+                exit 1
+              fi
+
+              part_size_text="$(format_bytes_for_telegram "$part_size")"
+              percent="$((90 + (part_index * 8 / part_count)))"
+
+              if [ "$percent" -gt 98 ]; then
+                percent="98"
+              fi
+
+              echo "SENDING_DOCUMENT_PART=1"
+              echo "DOCUMENT_PART_INDEX=masked"
+              echo "DOCUMENT_PARTS_TOTAL=masked"
+              echo "::add-mask::${part_size}"
+              echo "DOCUMENT_PART_SIZE_BYTES=masked"
+              echo "DOCUMENT_PART_SEND_MODE=local"
+              echo "DOCUMENT_PART_FILE=masked"
+
+              progress_stage "sending_part" "$percent" "Sending" "Sending_document_part"
+
+              printf -v caption '%s\n📄 %s\n🧩 Part %s/%s\n📦 %s / %s' "$caption_prefix" "$safe_display" "$part_index" "$part_count" "$part_size_text" "$file_size_text"
+
+              telegram_edit_torrent_summary "✅ <b>GitHub Torrent part ${part_index}/${part_count}</b>" "⏳ <i>Sending split document part to Telegram...</i>" "$part_size" "local" "Document part" "${file_index}/${files_total}"
+
+              response_file="$RUNNER_TEMP/telegram-document-part-${file_index}-${part_index}.json"
+              http_code="$(telegram_send_document_request_with_retry "$api_base" "$part_path" "$part_name" "$caption" "$response_file" "document_part")"
+
+              echo "TELEGRAM_DOCUMENT_PART_HTTP_CODE=${http_code}"
+
+              if ! is_success_http_code "$http_code" || ! grep -q '"ok":true' "$response_file"; then
+                echo "Telegram document part send failed."
+                echo "Telegram response is hidden for public-log safety."
+                exit 1
+              fi
+
+              TOTAL_SENT_FILES=$((TOTAL_SENT_FILES + 1))
+              TOTAL_SENT_BYTES=$((TOTAL_SENT_BYTES + part_size))
+              LAST_SEND_MODE="local"
+              LAST_SEND_METHOD="Document parts"
+
+              rm -f "$part_path"
+              part_index="$((part_index + 1))"
+            done
+          }
+
+          echo "TORRENT_URL=masked"
+          echo "FILE_MODE=${FILE_MODE}"
+          echo "SELECTED_FILES=masked"
+          echo "SPLIT_PART_MIB=masked"
+          echo "LOCAL_BOT_API_MAX_BYTES=masked"
+          echo "SPLIT_PART_BYTES=masked"
+
+          if [ -n "${TORRENT_URL:-}" ]; then
+            echo "::add-mask::${TORRENT_URL}"
+          fi
+
+          if [ -n "${SELECTED_FILES:-}" ]; then
+            echo "::add-mask::${SELECTED_FILES}"
+          fi
+
+          if [ -n "${SPLIT_PART_MIB:-}" ]; then
+            echo "::add-mask::${SPLIT_PART_MIB}"
+          fi
+
+          if [ -n "${PROGRESS_CHAT_ID:-}" ]; then
+            echo "::add-mask::${PROGRESS_CHAT_ID}"
+          fi
+
+          if [ -n "${PROGRESS_MESSAGE_ID:-}" ]; then
+            echo "::add-mask::${PROGRESS_MESSAGE_ID}"
+          fi
+
+          if [ -n "${DISPATCH_KEY:-}" ]; then
+            echo "::add-mask::${DISPATCH_KEY}"
+          fi
+
+          if [ -z "$TORRENT_URL" ]; then
+            echo "ERROR: torrent_url input is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_TOKEN:-}" ]; then
+            echo "ERROR: TELEGRAM_TOKEN secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "ERROR: TELEGRAM_CHAT_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_API_ID:-}" ]; then
+            echo "ERROR: TELEGRAM_API_ID secret is missing."
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_API_HASH:-}" ]; then
+            echo "ERROR: TELEGRAM_API_HASH secret is missing."
+            exit 1
+          fi
+
+          echo "::add-mask::${TELEGRAM_TOKEN}"
+          echo "::add-mask::${TELEGRAM_CHAT_ID}"
+          echo "::add-mask::${TELEGRAM_API_ID}"
+          echo "::add-mask::${TELEGRAM_API_HASH}"
+
+          case "$FILE_MODE" in
+            list|selected|all)
+              ;;
+            *)
+              FILE_MODE="list"
+              ;;
+          esac
+
+          if [ "$FILE_MODE" = "selected" ] && [ -z "$SELECTED_FILES" ]; then
+            echo "ERROR: selected_files is required when file_mode=selected."
+            exit 1
+          fi
+
+          if [ -n "$SELECTED_FILES" ] && ! printf "%s" "$SELECTED_FILES" | grep -Eq '^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$'; then
+            echo "ERROR: selected_files must look like 1 or 1,3 or 1-4."
+            exit 1
+          fi
+
+          SELECTED_FILES_EXPANDED="$SELECTED_FILES"
+
+          if [ "$FILE_MODE" = "selected" ]; then
+            SELECTED_FILES_EXPANDED=""
+
+            IFS=',' read -ra selected_parts <<< "$SELECTED_FILES"
+
+            for selected_part in "${selected_parts[@]}"; do
+              selected_part="${selected_part//[[:space:]]/}"
+
+              if [ -z "$selected_part" ]; then
+                continue
+              fi
+
+              if [[ "$selected_part" == *-* ]]; then
+                selected_start="${selected_part%-*}"
+                selected_end="${selected_part#*-}"
+
+                selected_start_num=$((10#$selected_start))
+                selected_end_num=$((10#$selected_end))
+
+                if [ "$selected_start_num" -gt "$selected_end_num" ]; then
+                  selected_tmp="$selected_start_num"
+                  selected_start_num="$selected_end_num"
+                  selected_end_num="$selected_tmp"
+                fi
+
+                for ((selected_idx=selected_start_num; selected_idx<=selected_end_num; selected_idx++)); do
+                  if [[ ",$SELECTED_FILES_EXPANDED," != *",$selected_idx,"* ]]; then
+                    if [ -z "$SELECTED_FILES_EXPANDED" ]; then
+                      SELECTED_FILES_EXPANDED="$selected_idx"
+                    else
+                      SELECTED_FILES_EXPANDED="${SELECTED_FILES_EXPANDED},${selected_idx}"
+                    fi
+                  fi
+                done
+              else
+                selected_idx="$((10#$selected_part))"
+
+                if [[ ",$SELECTED_FILES_EXPANDED," != *",$selected_idx,"* ]]; then
+                  if [ -z "$SELECTED_FILES_EXPANDED" ]; then
+                    SELECTED_FILES_EXPANDED="$selected_idx"
+                  else
+                    SELECTED_FILES_EXPANDED="${SELECTED_FILES_EXPANDED},${selected_idx}"
+                  fi
+                fi
+              fi
+            done
+
+            if [ -z "$SELECTED_FILES_EXPANDED" ]; then
+              echo "ERROR: selected_files expansion produced an empty selection."
+              exit 1
+            fi
+
+            echo "::add-mask::${SELECTED_FILES_EXPANDED}"
+            echo "SELECTED_FILES_EXPANDED=masked"
+          fi
+
+          if ! printf "%s" "$SPLIT_PART_MIB" | grep -Eq '^[0-9]+$'; then
+            SPLIT_PART_MIB="1900"
+          fi
+
+          if [ "$SPLIT_PART_MIB" -lt 64 ]; then
+            SPLIT_PART_MIB="64"
+          fi
+
+          if [ "$SPLIT_PART_MIB" -gt "$SPLIT_PART_MIB_MAX" ]; then
+            SPLIT_PART_MIB="$SPLIT_PART_MIB_MAX"
+          fi
+
+          SPLIT_PART_BYTES="$((SPLIT_PART_MIB * 1024 * 1024))"
+
+          progress_stage "preparing" "10" "Preparing" "Preparing_worker"
+
+          if ! command -v aria2c >/dev/null 2>&1; then
+            progress_stage "installing_tools" "12" "Preparing" "Installing_torrent_downloader"
+            apt-get update >/dev/null
+            apt-get install -y --no-install-recommends aria2 >/dev/null
+            rm -rf /var/lib/apt/lists/*
+          fi
+
+          if ! command -v aria2c >/dev/null 2>&1; then
+            echo "ERROR: aria2c is not available."
+            exit 1
+          fi
+
+          if ! command -v telegram-bot-api >/dev/null 2>&1; then
+            echo "ERROR: telegram-bot-api is missing from worker image."
+            exit 1
+          fi
+
+          progress_stage "validating" "15" "Validating" "Validating_inputs_and_secrets"
+
+          DOWNLOAD_DIR="$RUNNER_TEMP/torrent-download"
+          TORRENT_FILE="$RUNNER_TEMP/input.torrent"
+          MANIFEST="$RUNNER_TEMP/torrent-files.txt"
+          LOWER_TORRENT_URL="$(printf "%s" "$TORRENT_URL" | tr '[:upper:]' '[:lower:]')"
+
+          rm -rf "$DOWNLOAD_DIR"
+          mkdir -p "$DOWNLOAD_DIR"
+
+          if printf "%s" "$LOWER_TORRENT_URL" | grep -q '^magnet:'; then
+            TORRENT_SOURCE="$TORRENT_URL"
+          elif printf "%s" "$LOWER_TORRENT_URL" | grep -Eq '^https?://'; then
+            progress_stage "fetching_torrent" "20" "Extracting" "Fetching_torrent_metadata"
+
+            curl -fsSL \
+              --connect-timeout 20 \
+              --max-time 120 \
+              --max-redirs 5 \
+              -o "$TORRENT_FILE" \
+              "$TORRENT_URL" >/dev/null 2>&1
+
+            if [ ! -s "$TORRENT_FILE" ]; then
+              echo "ERROR: Downloaded .torrent file is empty."
+              exit 1
+            fi
+
+            TORRENT_SOURCE="$TORRENT_FILE"
+          else
+            echo "ERROR: torrent_url must be a magnet link or direct http/https .torrent URL."
+            exit 1
+          fi
+
+          if [ "$FILE_MODE" = "list" ]; then
+            progress_stage "listing_files" "25" "Listing" "Fetching_torrent_file_list"
+
+            LIST_DIR="$RUNNER_TEMP/torrent-list"
+            LIST_LOG="$RUNNER_TEMP/torrent-list.log"
+            LIST_FETCH_LOG="$RUNNER_TEMP/torrent-list-fetch.log"
+            LIST_TORRENT_FILE=""
+            list_notice_body=""
+
+            rm -rf "$LIST_DIR"
+            mkdir -p "$LIST_DIR"
+
+            if printf "%s" "$LOWER_TORRENT_URL" | grep -q '^magnet:'; then
+              set +e
+
+              timeout 240s aria2c \
+                --dir="$LIST_DIR" \
+                --bt-metadata-only=true \
+                --bt-save-metadata=true \
+                --seed-time=0 \
+                --seed-ratio=0.0 \
+                --max-overall-upload-limit=1K \
+                --disable-ipv6=true \
+                --enable-dht=true \
+                --enable-dht6=false \
+                --dht-file-path="$RUNNER_TEMP/aria2-dht-list.dat" \
+                --bt-stop-timeout=180 \
+                --summary-interval=0 \
+                --console-log-level=warn \
+                "$TORRENT_SOURCE" > "$LIST_FETCH_LOG" 2>&1 &
+
+              ARIA2_METADATA_PID="$!"
+              ARIA2_METADATA_WAIT_SECONDS=0
+
+              while kill -0 "$ARIA2_METADATA_PID" >/dev/null 2>&1; do
+                sleep 5
+                ARIA2_METADATA_WAIT_SECONDS="$((ARIA2_METADATA_WAIT_SECONDS + 5))"
+
+                if [ "$((ARIA2_METADATA_WAIT_SECONDS % 20))" -eq 0 ]; then
+                  echo "ARIA2_METADATA_WAIT_SECONDS=masked"
+                  progress_stage "listing_files" "25" "Listing" "Fetching_torrent_file_list"
+                fi
+              done
+
+              wait "$ARIA2_METADATA_PID"
+              ARIA2_METADATA_RC="$?"
+
+              set -e
+
+              echo "ARIA2_METADATA_RC=${ARIA2_METADATA_RC}"
+              print_torrent_log_safely "$LIST_FETCH_LOG"
+
+              if [ "$ARIA2_METADATA_RC" -ne 0 ]; then
+                echo "ERROR: Could not fetch torrent metadata within the listing timeout."
+                exit 1
+              fi
+
+              LIST_TORRENT_FILE="$(find "$LIST_DIR" "$RUNNER_TEMP" "$PWD" -type f -name "*.torrent" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d " " -f2- || true)"
+            else
+              LIST_TORRENT_FILE="$TORRENT_SOURCE"
+            fi
+
+            if [ -z "$LIST_TORRENT_FILE" ] || [ ! -s "$LIST_TORRENT_FILE" ]; then
+              echo "ERROR: Could not fetch torrent metadata for file listing."
+              exit 1
+            fi
+
+            aria2c -S "$LIST_TORRENT_FILE" > "$LIST_LOG" 2>&1 || true
+
+            if [ ! -s "$LIST_LOG" ]; then
+              echo "ERROR: Torrent file list is empty."
+              exit 1
+            fi
+
+            SAFE_LIST="$(
+              awk -F'|' '
+                function trim(s) {
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                  return s
+                }
+
+                function clean_path(s) {
+                  gsub(/^\.\//, "", s)
+                  gsub(/^\/+|\/+$/, "", s)
+                  return s
+                }
+
+                function add_item(idx, path, size,    n, parts, folder, filename, j) {
+                  path = clean_path(path)
+
+                  if (path == "") {
+                    path = "unnamed"
+                  }
+
+                  n = split(path, parts, "/")
+
+                  if (n > 1) {
+                    filename = parts[n]
+                    folder = parts[1]
+
+                    for (j = 2; j < n; j++) {
+                      folder = folder "/" parts[j]
+                    }
+                  } else {
+                    filename = path
+                    folder = "Files"
+                  }
+
+                  if (!(folder in folder_seen)) {
+                    folder_seen[folder] = 1
+                    folder_count++
+                    folder_order[folder_count] = folder
+                  }
+
+                  item_count[folder]++
+                  item_idx[folder, item_count[folder]] = idx
+                  item_name[folder, item_count[folder]] = filename
+                  item_size[folder, item_count[folder]] = size
+                }
+
+                /^[[:space:]]*[0-9]+[[:space:]]*\|/ {
+                  idx = trim($1)
+                  path = trim($2)
+                  size = ""
+
+                  if ((getline nextline) > 0 && nextline ~ /^[[:space:]]*\|/) {
+                    split(nextline, parts, "|")
+                    size = trim(parts[2])
+                  }
+
+                  total_items++
+
+                  if (total_items <= 80) {
+                    add_item(idx, path, size)
+                  }
+                }
+
+                END {
+                  for (g = 1; g <= folder_count; g++) {
+                    folder = folder_order[g]
+
+                    if (g > 1) {
+                      print ""
+                    }
+
+                    if (folder == "Files") {
+                      print "📄 Files"
+                    } else {
+                      print "📁 " folder
+                    }
+
+                    for (i = 1; i <= item_count[folder]; i++) {
+                      print item_idx[folder, i] ") " item_name[folder, i]
+
+                      if (item_size[folder, i] != "") {
+                        print "   " item_size[folder, i]
+                      }
+                    }
+                  }
+                }
+              ' "$LIST_LOG"
+            )"
+
+            if [ -z "$SAFE_LIST" ]; then
+              echo "ERROR: Could not parse torrent file indexes from aria2 output."
+              print_torrent_log_safely "$LIST_LOG"
+              exit 1
+            fi
+
+            SAFE_LIST="$(printf "%s" "$SAFE_LIST" | python3 -c 'import sys; text=sys.stdin.read(); print(text[:3200], end="")')"
+
+            printf -v list_notice_body '%s\n\nRun again with:\nfile_mode=selected\nselected_files=1 or 1,3 or 1-4' "$SAFE_LIST"
+
+            send_notice "🧲 Torrent file list" "$list_notice_body"
+
+            echo "TORRENT_LIST_SENT=1"
+            echo "TORRENT_LIST_ITEMS=masked"
+
+            progress_stage "listed" "100" "Listed" "Torrent_file_list_sent"
+            telegram_edit_torrent_summary "✅ <b>GitHub Torrent list ready</b>" "📋 <i>File list was sent to Telegram.</i>" "0" "none" "List only" "0"
+            exit 0
+          fi
+
+          if [ "$FILE_MODE" = "selected" ] && printf "%s" "$LOWER_TORRENT_URL" | grep -q '^magnet:'; then
+            progress_stage "preparing_selected_metadata" "28" "Preparing" "Preparing_selected_torrent_metadata"
+
+            SELECT_DIR="$RUNNER_TEMP/torrent-selected"
+            SELECT_FETCH_LOG="$RUNNER_TEMP/torrent-selected-fetch.log"
+            SELECT_TORRENT_FILE=""
+
+            rm -rf "$SELECT_DIR"
+            mkdir -p "$SELECT_DIR"
+
+            set +e
+
+            timeout 240s aria2c \
+              --dir="$SELECT_DIR" \
+              --bt-metadata-only=true \
+              --bt-save-metadata=true \
+              --seed-time=0 \
+              --seed-ratio=0.0 \
+              --max-overall-upload-limit=1K \
+              --disable-ipv6=true \
+              --enable-dht=true \
+              --enable-dht6=false \
+              --dht-file-path="$RUNNER_TEMP/aria2-dht-selected.dat" \
+              --bt-stop-timeout=180 \
+              --summary-interval=0 \
+              --console-log-level=warn \
+              "$TORRENT_SOURCE" > "$SELECT_FETCH_LOG" 2>&1 &
+
+            ARIA2_SELECTED_METADATA_PID="$!"
+            ARIA2_SELECTED_METADATA_WAIT_SECONDS=0
+
+            while kill -0 "$ARIA2_SELECTED_METADATA_PID" >/dev/null 2>&1; do
+              sleep 5
+              ARIA2_SELECTED_METADATA_WAIT_SECONDS="$((ARIA2_SELECTED_METADATA_WAIT_SECONDS + 5))"
+
+              if [ "$((ARIA2_SELECTED_METADATA_WAIT_SECONDS % 20))" -eq 0 ]; then
+                echo "ARIA2_SELECTED_METADATA_WAIT_SECONDS=masked"
+                progress_stage "preparing_selected_metadata" "28" "Preparing" "Preparing_selected_torrent_metadata"
+              fi
+            done
+
+            wait "$ARIA2_SELECTED_METADATA_PID"
+            ARIA2_SELECTED_METADATA_RC="$?"
+
+            set -e
+
+            echo "ARIA2_SELECTED_METADATA_RC=${ARIA2_SELECTED_METADATA_RC}"
+            print_torrent_log_safely "$SELECT_FETCH_LOG"
+
+            if [ "$ARIA2_SELECTED_METADATA_RC" -ne 0 ]; then
+              echo "ERROR: Could not fetch selected torrent metadata."
+              exit 1
+            fi
+
+            SELECT_TORRENT_FILE="$(find "$SELECT_DIR" "$RUNNER_TEMP" "$PWD" -type f -name "*.torrent" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d " " -f2- || true)"
+
+            if [ -z "$SELECT_TORRENT_FILE" ] || [ ! -s "$SELECT_TORRENT_FILE" ]; then
+              echo "ERROR: Selected torrent metadata file was not found."
+              exit 1
+            fi
+
+            TORRENT_SOURCE="$SELECT_TORRENT_FILE"
+          fi
+
+          progress_stage "downloading" "30" "Downloading" "Downloading_torrent_content"
+
+          ARIA2_SELECT_ARGS=()
+
+          if [ "$FILE_MODE" = "selected" ]; then
+            ARIA2_SELECT_ARGS+=(--select-file="$SELECTED_FILES_EXPANDED")
+          fi
+
+          ARIA2_DOWNLOAD_LOG="$RUNNER_TEMP/aria2-download.log"
+
+          set +e
+          aria2c \
+            --dir="$DOWNLOAD_DIR" \
+            --seed-time=0 \
+            --seed-ratio=0.0 \
+            --max-overall-upload-limit=1K \
+            --disable-ipv6=true \
+            --enable-dht=true \
+            --enable-dht6=false \
+            --dht-file-path="$RUNNER_TEMP/aria2-dht-download.dat" \
+            --follow-torrent=mem \
+            --bt-remove-unselected-file=true \
+            --bt-stop-timeout=300 \
+            --bt-max-peers=80 \
+            --max-connection-per-server=8 \
+            --split=8 \
+            --min-split-size=1M \
+            --file-allocation=none \
+            --allow-overwrite=true \
+            --auto-file-renaming=false \
+            --summary-interval=30 \
+            --console-log-level=warn \
+            "${ARIA2_SELECT_ARGS[@]}" \
+            "$TORRENT_SOURCE" > "$ARIA2_DOWNLOAD_LOG" 2>&1
+          ARIA2_DOWNLOAD_RC="$?"
+          set -e
+
+          echo "ARIA2_DOWNLOAD_RC=${ARIA2_DOWNLOAD_RC}"
+
+          if [ "$ARIA2_DOWNLOAD_RC" -ne 0 ]; then
+            print_torrent_log_safely "$ARIA2_DOWNLOAD_LOG"
+            echo "ERROR: Torrent download failed."
+            exit 1
+          fi
+
+          echo "TORRENT_DOWNLOAD=success"
+          progress_stage "downloaded" "55" "Downloaded" "Torrent_download_completed"
+
+          rm -f "$MANIFEST"
+
+          if [ "$FILE_MODE" = "selected" ]; then
+            SELECT_INDEX_LOG="$RUNNER_TEMP/torrent-selected-index.log"
+            SELECTED_REL_PATHS="$RUNNER_TEMP/torrent-selected-paths.txt"
+
+            aria2c -S "$TORRENT_SOURCE" > "$SELECT_INDEX_LOG" 2>&1 || true
+
+            awk -F'|' -v selected=",$SELECTED_FILES_EXPANDED," '
+              function trim(s) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                return s
+              }
+
+              /^[[:space:]]*[0-9]+[[:space:]]*\|/ {
+                idx = trim($1)
+                path = trim($2)
+
+                if (index(selected, "," idx ",") > 0) {
+                  gsub(/^\.\//, "", path)
+                  gsub(/^\/+|\/+$/, "", path)
+
+                  if (path != "") {
+                    print path
+                  }
+                }
+              }
+            ' "$SELECT_INDEX_LOG" > "$SELECTED_REL_PATHS"
+
+            if [ ! -s "$SELECTED_REL_PATHS" ]; then
+              echo "ERROR: Could not map selected torrent indexes to file paths."
+              print_torrent_log_safely "$SELECT_INDEX_LOG"
+              exit 1
+            fi
+
+            while IFS= read -r rel_path; do
+              selected_path="$DOWNLOAD_DIR/$rel_path"
+
+              if [ ! -f "$selected_path" ]; then
+                echo "ERROR: Selected file was not downloaded."
+                echo "TORRENT_SELECTED_REL_PATH=masked"
+                exit 1
+              fi
+
+              selected_size="$(stat -c%s "$selected_path" 2>/dev/null || echo 0)"
+
+              if [ "$selected_size" -le 0 ]; then
+                echo "ERROR: Selected file is empty after download."
+                echo "TORRENT_SELECTED_REL_PATH=masked"
+                exit 1
+              fi
+
+              printf "%s\t%s\n" "$selected_size" "$selected_path"
+            done < "$SELECTED_REL_PATHS" \
+              | sort -nr \
+              | cut -f2- > "$MANIFEST"
+          else
+            find "$DOWNLOAD_DIR" -type f ! -name "*.aria2" -printf "%s\t%p\n" \
+              | sort -nr \
+              | cut -f2- > "$MANIFEST"
+          fi
+
+          if [ ! -s "$MANIFEST" ]; then
+            echo "ERROR: No downloaded files were found."
+            exit 1
+          fi
+
+          echo "TORRENT_SELECTED_FILES_MANIFEST=masked"
+          echo "TORRENT_SELECTED_FILES_COUNT=masked"
+
+          progress_stage "preparing_upload" "65" "Preparing" "Preparing_Telegram_upload"
+
+          total_files="$(grep -c . "$MANIFEST" 2>/dev/null || echo 0)"
+          current_file="0"
+
+          while IFS= read -r file_path; do
+            current_file="$((current_file + 1))"
+
+            if [ ! -f "$file_path" ]; then
+              echo "ERROR: Selected file is missing."
+              exit 1
+            fi
+
+            original_name="$(basename "$file_path")"
+            display_name="$(sanitize_filename "" "$original_name")"
+
+            file_size="$(stat -c%s "$file_path" 2>/dev/null || echo 0)"
+
+            echo "TORRENT_CURRENT_FILE=masked"
+            echo "::add-mask::${file_size}"
+            echo "TORRENT_CURRENT_FILE_SIZE_BYTES=masked"
+
+            progress_stage "preparing_file" "70" "Preparing" "Preparing_document_file"
+
+            caption_prefix=""
+            printf -v caption_prefix '🧲 <b>Torrent Document</b>\n🧭 File %s/%s' "$current_file" "$total_files"
+
+            send_document_file "$file_path" "$display_name" "$caption_prefix" "$current_file" "$total_files"
+
+            rm -f "$file_path" || true
+          done < "$MANIFEST"
+
+          progress_stage "sent" "98" "Finalizing" "Telegram_document_send_completed"
+
+          echo "PROGRESS_STAGE=completed"
+          echo "PROGRESS_PERCENT=100"
+          echo "PROGRESS_LABEL=Completed"
+          echo "PROGRESS_DETAIL=Torrent_document_completed"
+
+          telegram_edit_torrent_summary \
+            "✅ <b>GitHub Torrent completed</b>" \
+            "" \
+            "${TOTAL_SENT_BYTES:-0}" \
+            "${LAST_SEND_MODE:-local}" \
+            "${LAST_SEND_METHOD:-Document}" \
+            "${TOTAL_SENT_FILES:-0}"
