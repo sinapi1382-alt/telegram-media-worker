@@ -12,23 +12,36 @@ jobs:
   download:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Install aria2
-        run: sudo apt-get update && sudo apt-get install -y aria2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2
+
+      - name: Create download folder
+        run: mkdir -p downloaded_files
 
       - name: Download with aria2
         run: |
           aria2c --seed-time=0 \
+                 --bt-tracker-timeout=120 \
+                 --bt-stop-timeout=300 \
                  --max-connection-per-server=16 \
                  --split=16 \
                  --min-split-size=1M \
+                 --dir=downloaded_files \
                  --console-log-level=notice \
+                 --follow-torrent=mem \
                  "${{ inputs.torrent_url }}"
+        timeout-minutes: 30
+
+      - name: List downloaded files
+        run: |
+          echo "Files in downloaded_files:"
+          ls -la downloaded_files/ || echo "No files found!"
 
       - name: Upload as Artifact
         uses: actions/upload-artifact@v4
         with:
           name: torrent-download
-          path: ./
+          path: downloaded_files/
+          if-no-files-found: warn
